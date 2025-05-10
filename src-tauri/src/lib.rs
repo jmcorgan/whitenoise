@@ -136,7 +136,8 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-fn setup_logging(logs_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+// FIXME: Only public until it moves into new application class
+pub fn setup_logging(logs_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix("whitenoise")
