@@ -10,6 +10,9 @@ mod secrets_store;
 mod types;
 mod whitenoise;
 
+// Exposed publically as top-level application state
+pub mod core;
+
 use crate::commands::accounts::*;
 use crate::commands::groups::*;
 use crate::commands::key_packages::*;
