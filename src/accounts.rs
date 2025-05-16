@@ -173,7 +173,7 @@ impl Whitenoise {
         Ok(account)
     }
 
-    async fn find_by_pubkey(&self, pubkey: &PublicKey) -> Result<AccountRow> {
+    async fn find_by_pubkey(&self, pubkey: &PublicKey) -> Result<Account> {
         let mut txn = self.database.pool.begin().await?;
 
         match sqlx::query_as::<_, AccountRow>("SELECT * FROM accounts WHERE pubkey = ?")
@@ -181,7 +181,7 @@ impl Whitenoise {
             .fetch_one(&mut *txn)
             .await
         {
-            Ok(row) => Ok(row),
+            Ok(row) => Ok(Account::try_from(row)?),
             Err(e) => {
                 tracing::error!(target: "whitenoise::accounts", "Error fetching account: {}", e);
                 Err(AccountError::DatabaseError(e.into()))
@@ -200,13 +200,11 @@ impl Whitenoise {
         let pubkey = keys.public_key();
 
         // Try to find existing account using the existing find_by_pubkey method
-        let account_row = self.find_by_pubkey(&pubkey).await;
+        let account = self.find_by_pubkey(&pubkey).await;
 
-        match account_row {
-            Ok(row) => {
+        match account {
+            Ok(account) => {
                 tracing::debug!(target: "whitenoise::login", "Account found");
-
-                let account = Account::try_from(row)?;
 
                 // Store the private key
                 secrets_store::store_private_key(&keys, &self.config.data_dir)?;
@@ -300,6 +298,13 @@ impl Whitenoise {
                 Ok(account)
             }
         }
+    }
+
+    pub async fn logout(&self, pubkey: PublicKey, delete_data: bool) -> Result<()> {
+        let account = self.find_by_pubkey(&pubkey).await?;
+        account.remove().await?;  // FIXME: where does this go, and what does the bool argument do
+
+        Ok(())
     }
 }
 
