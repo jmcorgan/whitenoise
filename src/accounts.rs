@@ -2,7 +2,7 @@ use crate::database::DatabaseError;
 use crate::nostr_manager;
 use crate::relays::RelayType;
 use crate::secrets_store;
-use crate::Whitenoise
+use crate::Whitenoise;
 
 use nostr_mls::prelude::*;
 use nostr_mls_sqlite_storage::NostrMlsSqliteStorage;
@@ -172,129 +172,138 @@ impl Whitenoise {
         tracing::debug!(target: "whitenoise::accounts", "Account created successfully");
         Ok(account)
     }
+
+    async fn find_by_pubkey(&self, pubkey: &PublicKey) -> Result<AccountRow> {
+        let mut txn = self.database.pool.begin().await?;
+
+        match sqlx::query_as::<_, AccountRow>("SELECT * FROM accounts WHERE pubkey = ?")
+            .bind(pubkey.to_hex().as_str())
+            .fetch_one(&mut *txn)
+            .await
+        {
+            Ok(row) => Ok(row),
+            Err(e) => {
+                tracing::error!(target: "whitenoise::accounts", "Error fetching account: {}", e);
+                Err(AccountError::DatabaseError(e.into()))
+            }
+        }
+    }
+
+    pub async fn login(&self, nsec_or_hex_privkey: String) -> Result<Account> {
+        let keys = Keys::parse(&nsec_or_hex_privkey).map_err(|e| {
+            AccountError::NostrManagerError(nostr_manager::NostrManagerError::AccountError(
+                e.to_string(),
+            ))
+        })?;
+
+        // Try to find existing account
+        let pubkey = keys.public_key();
+
+        // Try to find existing account using the existing find_by_pubkey method
+        let account_row = self.find_by_pubkey(&pubkey).await;
+
+        match account_row {
+            Ok(row) => {
+                tracing::debug!(target: "whitenoise::login", "Account found");
+
+                let account = Account::try_from(row)?;
+
+                // Store the private key
+                secrets_store::store_private_key(&keys, &self.config.data_dir)?;
+
+                // Return the account wrapped in Ok
+                Ok(account)
+            }
+
+            Err(_) => {
+                tracing::debug!(target: "whitenoise::login", "Account not found, adding from keys");
+
+                // Create account
+                let mut account = Account {
+                    pubkey: keys.public_key(),
+                    metadata: Metadata::default(),
+                    settings: AccountSettings::default(),
+                    onboarding: AccountOnboarding::default(),
+                    last_used: Timestamp::now(),
+                    last_synced: Timestamp::zero(),
+                    active: false,
+                };
+
+                // Fetch metadata & relays from Nostr
+                let metadata = self
+                    .nostr
+                    .fetch_user_metadata(keys.public_key())
+                    .await
+                    .map_err(AccountError::NostrManagerError);
+                let nostr_relays = self
+                    .nostr
+                    .fetch_user_relays(keys.public_key())
+                    .await
+                    .map_err(AccountError::NostrManagerError);
+                let inbox_relays = self
+                    .nostr
+                    .fetch_user_inbox_relays(keys.public_key())
+                    .await
+                    .map_err(AccountError::NostrManagerError);
+                let key_package_relays = self
+                    .nostr
+                    .fetch_user_key_package_relays(keys.public_key())
+                    .await
+                    .map_err(AccountError::NostrManagerError);
+                let key_packages = self
+                    .nostr
+                    .fetch_user_key_packages(keys.public_key())
+                    .await
+                    .map_err(AccountError::NostrManagerError)?;
+
+                let mut onboarding = AccountOnboarding::default();
+
+                let unwrapped_metadata = match metadata {
+                    Ok(Some(metadata)) => metadata.to_owned(),
+                    _ => Metadata::default(),
+                };
+
+                let nostr_relays_unwrapped = nostr_relays.unwrap_or_default();
+                let inbox_relays_unwrapped = inbox_relays.unwrap_or_default();
+                let key_package_relays_unwrapped = key_package_relays.unwrap_or_default();
+
+                if !inbox_relays_unwrapped.is_empty() {
+                    onboarding.inbox_relays = true;
+                }
+                if !key_package_relays_unwrapped.is_empty() {
+                    onboarding.key_package_relays = true;
+                }
+                if !key_packages.is_empty() {
+                    onboarding.publish_key_package = true;
+                }
+
+                account.metadata = unwrapped_metadata;
+                account.onboarding = onboarding;
+
+                // Save the account to the database
+                account.save().await?;
+
+                // Insert relays
+                account
+                    .update_relays(RelayType::Nostr, &nostr_relays_unwrapped)
+                    .await?;
+                account
+                    .update_relays(RelayType::Inbox, &inbox_relays_unwrapped)
+                    .await?;
+                account
+                    .update_relays(RelayType::KeyPackage, &key_package_relays_unwrapped)
+                    .await?;
+
+                // Store the private key
+                secrets_store::store_private_key(&keys, &self.config.data_dir)?;
+
+                Ok(account)
+            }
+        }
+    }
 }
 
 impl Account {
-    /// Adds an account from an existing keypair
-    pub async fn add_from_keys(keys: &Keys, set_active: bool) -> Result<Self> {
-        let pubkey = keys.public_key();
-
-        tracing::debug!(target: "whitenoise::accounts", "Adding account for pubkey: {}", pubkey.to_hex());
-
-        // Fetch metadata & relays from Nostr
-        let metadata = wn
-            .nostr
-            .fetch_user_metadata(pubkey)
-            .await
-            .map_err(AccountError::NostrManagerError);
-        tracing::debug!(target: "whitenoise::accounts", "Fetched metadata for pubkey: {}", pubkey.to_hex());
-        let nostr_relays = wn
-            .nostr
-            .fetch_user_relays(pubkey)
-            .await
-            .map_err(AccountError::NostrManagerError);
-        tracing::debug!(target: "whitenoise::accounts", "Fetched relays for pubkey: {}", pubkey.to_hex());
-        let inbox_relays = wn
-            .nostr
-            .fetch_user_inbox_relays(pubkey)
-            .await
-            .map_err(AccountError::NostrManagerError);
-        tracing::debug!(target: "whitenoise::accounts", "Fetched inbox relays for pubkey: {}", pubkey.to_hex());
-        let key_package_relays = wn
-            .nostr
-            .fetch_user_key_package_relays(pubkey)
-            .await
-            .map_err(AccountError::NostrManagerError);
-        tracing::debug!(target: "whitenoise::accounts", "Fetched key package relays for pubkey: {}", pubkey.to_hex());
-        let key_packages = wn
-            .nostr
-            .fetch_user_key_packages(pubkey)
-            .await
-            .map_err(AccountError::NostrManagerError)?;
-        tracing::debug!(target: "whitenoise::accounts", "Fetched key packages for pubkey: {}", pubkey.to_hex());
-
-        let mut onboarding = AccountOnboarding::default();
-
-        let unwrapped_metadata = match metadata {
-            Ok(Some(metadata)) => metadata.to_owned(),
-            _ => Metadata::default(),
-        };
-
-        let nostr_relays_unwrapped = nostr_relays.unwrap_or_default();
-        let inbox_relays_unwrapped = inbox_relays.unwrap_or_default();
-        let key_package_relays_unwrapped = key_package_relays.unwrap_or_default();
-
-        if !inbox_relays_unwrapped.is_empty() {
-            onboarding.inbox_relays = true;
-        }
-        if !key_package_relays_unwrapped.is_empty() {
-            onboarding.key_package_relays = true;
-        }
-        if !key_packages.is_empty() {
-            onboarding.publish_key_package = true;
-        }
-
-        tracing::debug!(target: "whitenoise::accounts", "Creating account with metadata: {:?}", unwrapped_metadata);
-
-        let account = Self {
-            pubkey,
-            metadata: unwrapped_metadata,
-            settings: AccountSettings::default(),
-            onboarding,
-            last_used: Timestamp::now(),
-            last_synced: Timestamp::zero(),
-            active: false,
-        };
-
-        tracing::debug!(target: "whitenoise::accounts", "Saving new account to database");
-        account.save().await?;
-
-        tracing::debug!(target: "whitenoise::accounts", "Inserting nostr relays, {:?}", nostr_relays_unwrapped);
-        account
-            .update_relays(RelayType::Nostr, &nostr_relays_unwrapped)
-            .await?;
-
-        tracing::debug!(target: "whitenoise::accounts", "Inserting inbox relays, {:?}", inbox_relays_unwrapped);
-        account
-            .update_relays(RelayType::Inbox, &inbox_relays_unwrapped)
-            .await?;
-
-        tracing::debug!(target: "whitenoise::accounts", "Inserting key package relays, {:?}", key_package_relays_unwrapped);
-        account
-            .update_relays(RelayType::KeyPackage, &key_package_relays_unwrapped)
-            .await?;
-
-        tracing::debug!(target: "whitenoise::accounts", "Storing private key");
-        secrets_store::store_private_key(keys, &wn.data_dir)?;
-
-        // Set active if requested
-        if set_active {
-            account.set_active().await?;
-        }
-
-        Ok(account)
-    }
-
-    /// Finds an account by its public key
-    pub async fn find_by_pubkey(pubkey: &PublicKey) -> Result<Self> {
-        let mut txn = wn.database.pool.begin().await?;
-
-        let row = sqlx::query_as::<_, AccountRow>("SELECT * FROM accounts WHERE pubkey = ?")
-            .bind(pubkey.to_hex().as_str())
-            .fetch_one(&mut *txn)
-            .await?;
-
-        Ok(Self {
-            pubkey: PublicKey::parse(row.pubkey.as_str())?,
-            metadata: serde_json::from_str(&row.metadata)?,
-            settings: serde_json::from_str(&row.settings)?,
-            onboarding: serde_json::from_str(&row.onboarding)?,
-            last_used: Timestamp::from(row.last_used),
-            last_synced: Timestamp::from(row.last_synced),
-            active: row.active,
-        })
-    }
-
     /// Returns all accounts
     pub async fn all() -> Result<Vec<Self>> {
         let mut txn = wn.database.pool.begin().await?;
