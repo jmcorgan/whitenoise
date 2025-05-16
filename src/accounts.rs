@@ -2,6 +2,7 @@ use crate::database::DatabaseError;
 use crate::nostr_manager;
 use crate::relays::RelayType;
 use crate::secrets_store;
+use crate::Whitenoise
 
 use nostr_mls::prelude::*;
 use nostr_mls_sqlite_storage::NostrMlsSqliteStorage;
@@ -96,13 +97,38 @@ pub struct Account {
     pub active: bool,
 }
 
-impl Account {
-    /// Generates a new keypair, generates a petname, and saves the mostly blank account to the database
-    pub async fn new() -> Result<Self> {
-        tracing::debug!(target: "whitenoise::accounts", "Generating new keypair");
+/// Conversion from AccountRow to Account
+impl TryFrom<AccountRow> for Account {
+    type Error = AccountError;
+
+    fn try_from(row: AccountRow) -> Result<Self> {
+        Ok(Self {
+            pubkey: PublicKey::parse(row.pubkey.as_str())?,
+            metadata: serde_json::from_str(&row.metadata)?,
+            settings: serde_json::from_str(&row.settings)?,
+            onboarding: serde_json::from_str(&row.onboarding)?,
+            last_used: Timestamp::from(row.last_used),
+            last_synced: Timestamp::from(row.last_synced),
+            active: row.active,
+        })
+    }
+}
+
+/// Whitenoise methods for account management
+impl Whitenoise {
+    /// Creates a new account with a freshly generated keypair
+    ///
+    /// # Returns
+    /// * `Result<Account>` - The newly created account
+    ///
+    /// # Errors
+    /// Returns error if the account creation fails
+    pub async fn create_account(&self) -> Result<Account> {
+        tracing::debug!(target: "whitenoise::accounts", "Creating new account");
+
         let keys = Keys::generate();
 
-        let mut account = Self {
+        let mut account = Account {
             pubkey: keys.public_key(),
             metadata: Metadata::default(),
             settings: AccountSettings::default(),
@@ -131,20 +157,24 @@ impl Account {
             .collect::<Vec<String>>()
             .join(" ");
 
-        tracing::debug!(target: "whitenoise::accounts::new", "Generated petname: {}", petname);
-        // Update account metadata with petname - metadata fields expect Option<String>
+        tracing::debug!(target: "whitenoise::accounts", "Generated petname: {}", petname);
+
+        // Update account metadata with petname
         account.metadata.name = Some(petname.clone());
         account.metadata.display_name = Some(petname);
 
-        // Save the updated account to the database
+        // Save the account to the database
         account = account.save().await?;
 
-        // If the record saves, add the keys to the secret store
-        secrets_store::store_private_key(&keys, &wn.data_dir)?;
+        // Store the private key in the secrets store
+        secrets_store::store_private_key(&keys, &self.config.data_dir)?;
 
+        tracing::debug!(target: "whitenoise::accounts", "Account created successfully");
         Ok(account)
     }
+}
 
+impl Account {
     /// Adds an account from an existing keypair
     pub async fn add_from_keys(keys: &Keys, set_active: bool) -> Result<Self> {
         let pubkey = keys.public_key();
@@ -415,9 +445,7 @@ impl Account {
         );
 
         // If the database operation is successful, update Nostr client
-        wn.nostr
-            .set_nostr_identity(self)
-            .await?;
+        wn.nostr.set_nostr_identity(self).await?;
 
         tracing::debug!(
             target: "whitenoise::accounts::set_active",
@@ -604,9 +632,7 @@ impl Account {
 
         // Update Nostr client & Nostr MLS
         let account = Self::get_active().await?;
-        wn.nostr
-            .set_nostr_identity(&account)
-            .await?;
+        wn.nostr.set_nostr_identity(&account).await?;
 
         // Then update Nostr MLS instance
         {
@@ -771,12 +797,9 @@ impl Account {
         tracing::debug!(target: "whitenoise::accounts::onboard_new_account", "Published metadata event to Nostr: {:?}", event);
 
         // Also publish relay lists to Nostr
-        self.publish_relay_list(RelayType::Nostr)
-            .await?;
-        self.publish_relay_list(RelayType::Inbox)
-            .await?;
-        self.publish_relay_list(RelayType::KeyPackage)
-            .await?;
+        self.publish_relay_list(RelayType::Nostr).await?;
+        self.publish_relay_list(RelayType::Inbox).await?;
+        self.publish_relay_list(RelayType::KeyPackage).await?;
 
         // Publish key package to key package relays
         if let Err(e) = crate::key_packages::publish_key_package().await {
